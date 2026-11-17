@@ -14,6 +14,18 @@
 #   failed start  the previous start never answered /healthz, so mark-healthy
 #                 never cleared $state/start-pending
 #
+# The repair owns its maintenance window (see maintenance.sh). Before Doctor
+# starts it creates $HOME/.openclaw/MAINTENANCE (so the Kubernetes startup
+# probe keeps passing) and a $state/repair-in-progress record, consuming
+# force-repair into it. Doctor then runs as a watched child with its own
+# deadlines, because systemd's TimeoutStartSec is only a finite backstop above
+# them (the drop-in explains why it is not extended dynamically):
+#
+#   progress  Doctor's output must keep growing; PROGRESS_SECS of silence kills
+#             it. Doctor is chatty while it works, so silence means stuck.
+#   hard cap  HARD_CAP_SECS from the start, whatever the output looks like.
+#   heartbeat the marker is re-touched every HEARTBEAT_SECS while Doctor lives.
+#
 # Failure policy:
 #   forced/upgrade  fail closed: exit non-zero so the gateway does not start on
 #                   unrepaired state, and write $state/repair-blocked. While
@@ -21,35 +33,141 @@
 #                   systemd's automatic restarts and later pod boots) fail
 #                   immediately without re-running Doctor, and
 #                   openclaw-probe-live reports the container live, so it
-#                   stays up for inspection instead of restart-looping. Touch
-#                   force-repair (newer than repair-blocked) to retry.
+#                   stays up for inspection instead of restart-looping. Run
+#                   repair-retry to try again.
 #   failed start    fail open: log it and start anyway. After MAX_ATTEMPTS
 #                   repairs that did not lead to a healthy start, stop
 #                   repairing until the gateway is healthy again, so a broken
 #                   repair cannot loop forever.
+#   interrupted     a start that finds a repair-in-progress record whose owner
+#                   is gone (killed, OOM, pod restart, node drain) does NOT
+#                   run Doctor again, in ANY mode (forced, upgrade or failed
+#                   start): it writes repair-blocked and exits non-zero, and a
+#                   second full Doctor is an operator decision (repair-retry).
+#                   Once Doctor has succeeded the record says so (doctor_ok),
+#                   and a later start finishes the repair without Doctor.
 #
 # Doctor runs with OPENCLAW_SERVICE_REPAIR_POLICY=external: systemd owns the
 # gateway lifecycle here, so Doctor must not stop, start or reinstall it.
+#
+# Test hooks (never set in production; every one is named OPENCLAW_SYSTEMD_TEST_*
+# and write-env-file.mjs refuses to propagate that prefix from the pod
+# environment into the user manager): OPENCLAW_SYSTEMD_TEST_SIMULATE
+# (ok|fail|silent|chatty) replaces Doctor; the *_SECS / _TICK variables below
+# shorten the timings.
 set -u
 
 [ "${1:-}" = openclaw-gateway.service ] || exit 0
 
 MAX_ATTEMPTS=2
+# Hard cap 3h: the 2026.11.5 upgrade Doctor ran past 15 minutes and an operator
+# settled on 1h by hand, so 3h leaves a wide margin while staying under the
+# Kubernetes startup probe's 240-minute marker window.
+HARD_CAP_SECS=${OPENCLAW_SYSTEMD_TEST_HARD_CAP_SECS:-10800}
+# 30 minutes of total silence: plugin installs can be quiet for minutes, but
+# half an hour with nothing written is a hang, not work.
+PROGRESS_SECS=${OPENCLAW_SYSTEMD_TEST_PROGRESS_SECS:-1800}
+HEARTBEAT_SECS=${OPENCLAW_SYSTEMD_TEST_HEARTBEAT_SECS:-60}
+TICK_SECS=${OPENCLAW_SYSTEMD_TEST_TICK:-1}
+# How long the marker covers the gateway coming up after a good repair.
+READY_SECS=${OPENCLAW_SYSTEMD_TEST_READY_SECS:-1800}
 state=${HOME:?HOME not set}/.openclaw/state/openclaw-systemd
 stamp=$state/repaired-version
 pending=$state/start-pending
 force=$state/force-repair
 blocked=$state/repair-blocked
+inprog=$state/repair-in-progress
+doclog=$state/doctor.log
+retry=/usr/local/libexec/openclaw-systemd/repair-retry
+
+here=$(dirname "$0")
+# shellcheck source=maintenance.sh
+. "$here/maintenance.sh"
 
 log() { echo "repair: $*"; }
+# Test hook only: SIGKILL this process at a named point, to prove each
+# boundary is recovered as an interruption.
+kill_point() { [ "${OPENCLAW_SYSTEMD_TEST_KILL_AT:-}" = "$1" ] && kill -KILL "$$"; return 0; }
 
 mkdir -p "$state" || { log "cannot create $state"; exit 1; }
+
+# Decision point: a marker left by a killed run must not grant anything.
+mt_reap
+
+# write_block <version> <reason>: repair-blocked, atomically and verified durable (a
+# directory in its place would swallow the rename). 0 only if it is in place.
+write_block() {
+  _wb_tmp=$blocked.tmp.$$
+  if printf '%s %s\n' "$1" "$2" > "$_wb_tmp" && mv -f "$_wb_tmp" "$blocked" && [ -f "$blocked" ] && [ ! -d "$blocked" ]; then
+    return 0
+  fi
+  rm -f "$_wb_tmp" "$blocked/$(basename "$_wb_tmp")" 2>/dev/null
+  return 1
+}
 
 current=$(/usr/local/bin/node -p 'require("/app/package.json").version' 2>/dev/null)
 if [ -z "$current" ]; then
   log "cannot read the OpenClaw version from /app/package.json"
   exit 1
 fi
+# A previous repair that never reached its end. Its owner is gone, so Doctor
+# was killed mid-run (and possibly left state half-converted). Do not run it
+# again on systemd's automatic restart. The record is written before anything
+# else a repair does (see below), so every kill point after it lands here.
+if [ -f "$inprog" ]; then
+  ipid=$(mt_field pid "$inprog")
+  if mt_pid_is_owner "$ipid" "$(mt_field pidstart "$inprog")"; then
+    log "another repair (pid $ipid) is still running; not starting a second one"
+    exit 1
+  fi
+  imode=$(mt_field mode "$inprog")
+  iversion=$(mt_field version "$inprog")
+  ireason=$(mt_field reason "$inprog")
+  idone=$(mt_field doctor_ok "$inprog")
+  if [ "$idone" = 1 ] && [ "$(sed -n '1s/ .*//p' "$blocked" 2>/dev/null)" != "$iversion" ]; then
+    # Doctor had already succeeded (the record says so) and the run died while
+    # finishing: the repair is done, so finish it here without Doctor, and
+    # without letting the failed-start logic below pick another repair.
+    log "an earlier repair finished Doctor but was killed before it completed; completing it without running Doctor"
+    if [ "$iversion" = "$current" ] && [ "$(cat "$stamp" 2>/dev/null)" != "$current" ]; then
+      if ! { echo "$current" > "$stamp.tmp" && mv -f "$stamp.tmp" "$stamp"; }; then
+        rm -f "$stamp.tmp" 2>/dev/null
+        log "cannot write $stamp; keeping $inprog so the next start still sees it"
+        exit 1
+      fi
+    fi
+    if [ "$imode" = closed ]; then
+      rm -f "$force" "$blocked"
+      echo 0 > "$pending" || log "warning: could not arm $pending"
+    fi
+    # The dead run's marker was reaped above, and the gateway is about to
+    # start: cover that start with a fresh awaiting-ready marker for THIS
+    # invocation, so the startup probe stays satisfied until /readyz and
+    # mark-healthy has something to remove. Created only if none exists.
+    mt_write awaiting-ready "$ireason" "" "$(date +%s)" "$(( $(date +%s) + READY_SECS ))" create
+    [ $? = 1 ] && log "warning: could not create $mt_marker for the readiness wait"
+    rm -f "$inprog"
+    exit 0
+  fi
+  # Any mode: a dead guard without doctor_ok means Doctor may have died
+  # half-way, so no further Doctor runs until the operator asks (repair-retry).
+  # That includes a failed-start repair; the attempt cap is not a substitute.
+  # Block durably BEFORE the record goes: a kill in between must still end up
+  # blocked. Idempotent: if we die after this, the next start finds the record
+  # again and writes the same block; if we die before it, the record is still
+  # there. Never remove the record unless the block is in place.
+  if ! write_block "${iversion:-unknown}" "interrupted: repair was killed before it finished ($ireason)"; then
+    log "cannot write $blocked; keeping $inprog so the next start still sees the interruption"
+    exit 1
+  fi
+  kill_point after-block
+  # The guard record is the request now: a force-repair left over from a kill
+  # between guard and consumption must not look like a fresh retry.
+  rm -f "$force"
+  log "an earlier repair was interrupted before it finished ($ireason)"
+  rm -f "$inprog"
+fi
+
 last=$(cat "$stamp" 2>/dev/null || true)
 
 # A failed fail-closed repair for this version holds the gateway down until
@@ -58,7 +176,7 @@ if [ -e "$blocked" ]; then
   blocked_version=$(sed -n '1s/ .*//p' "$blocked" 2>/dev/null)
   if [ "$blocked_version" = "$current" ] && ! [ "$force" -nt "$blocked" ]; then
     log "gateway held stopped: the last repair for $current failed ($(sed -n '1s/^[^ ]* //p' "$blocked"))."
-    log "not retrying automatically. After fixing the cause, retry with: touch $force && openclaw gateway start"
+    log "not retrying automatically. After fixing the cause, retry with: $retry"
     exit 1
   fi
 fi
@@ -94,34 +212,202 @@ if [ -z "$reason" ]; then
   exit 0
 fi
 
+start=$(date +%s)
+deadline=$((start + HARD_CAP_SECS))
+
+# Failed-start repairs count their attempt first, so a repair that hangs or is
+# killed still counts toward the cap, whether it dies before or after the guard.
 if [ "$mode" = open ]; then
-  # Count the attempt before running it, so a repair that hangs or is killed
-  # still counts toward the cap.
   echo $((attempts + 1)) > "$pending" || log "warning: could not record the attempt in $pending"
 fi
 
-log "running doctor --fix ($reason)"
-start=$(date +%s)
-case "${OPENCLAW_SYSTEMD_REPAIR_SIMULATE:-}" in
-  # Test hook only: exercises the decision logic without running Doctor.
-  ok) rc=0 ;;
-  fail) rc=1 ;;
-  *)
-    OPENCLAW_SERVICE_REPAIR_POLICY=external \
-      /usr/local/bin/node /app/openclaw.mjs doctor --fix --non-interactive
-    rc=$?
-    ;;
+# The interruption guard comes FIRST, before the marker and before force-repair
+# is consumed. If this process dies from here on, the next start reads the
+# record, sees a dead owner and refuses to run Doctor again (see the
+# interrupted branch above). Written whole and moved into place, so a reader
+# never sees a partial record. If it cannot be recorded, nothing else has been
+# touched yet, so a forced/upgrade repair simply does not start.
+write_guard() { # write_guard [extra key=value line]
+  {
+    echo "version=$current"
+    echo "mode=$mode"
+    echo "reason=$(printf '%s' "$reason" | tr '\n\r' '  ')"
+    echo "pid=$$"
+    echo "pidstart=$(mt_pidstart "$$")"
+    echo "invocation=${INVOCATION_ID:-}"
+    echo "start=$start"
+    [ -z "${1:-}" ] || echo "$1"
+  } > "$inprog.tmp.$$" && mv -f "$inprog.tmp.$$" "$inprog" || { rm -f "$inprog.tmp.$$" 2>/dev/null; return 1; }
+}
+# The first guard is written under the marker lock with the live-owner check
+# inside it, so repair-retry (which clears a dead record under the same lock)
+# and a second starting repair cannot interleave with it. Any record present
+# at this point means somebody else got there first: refuse, and let the next
+# start judge it (running owner: wait; dead owner: interrupted).
+write_guard_exclusive() {
+  mt_lock || return 1
+  if [ -f "$inprog" ]; then
+    mt_unlock
+    return 2
+  fi
+  write_guard; _wg=$?
+  mt_unlock
+  return $_wg
+}
+# Test hook only: pause between the decision and the guard write while the
+# named file exists, to prove the in-lock check closes that window.
+if [ -n "${OPENCLAW_SYSTEMD_TEST_HOLD_FILE:-}" ]; then
+  : > "$OPENCLAW_SYSTEMD_TEST_HOLD_FILE.reached"
+  while [ -e "$OPENCLAW_SYSTEMD_TEST_HOLD_FILE" ]; do sleep 0.1; done
+fi
+write_guard_exclusive
+case $? in
+  0) ;;
+  2) log "another repair record appeared first ($inprog); not starting a second repair"; exit 1 ;;
+  *) log "cannot write $inprog; refusing to run Doctor without recording it"; exit 1 ;;
 esac
-log "doctor exited $rc after $(( $(date +%s) - start ))s"
+kill_point after-guard
+
+# The marker comes BEFORE any Doctor work: without it the startup probe can
+# give up mid-repair. Created under the marker lock only if none exists. A
+# marker without our owner tag is an operator's; leave it alone. An owned
+# marker that survived mt_reap has a live owner: another run.
+own_marker=0
+mt_write repair "$reason" "$$" "$start" "$deadline" create
+case $? in
+  0) own_marker=1 ;;
+  2)
+    if mt_owned; then
+      rm -f "$inprog"
+      log "another run owns $mt_marker; not starting a second repair"
+      exit 1
+    fi
+    log "an operator-made $mt_marker exists; leaving it as is" ;;
+  *)
+    if [ "$mode" = closed ]; then
+      rm -f "$inprog"
+      log "cannot create $mt_marker; refusing to run Doctor without a maintenance window"
+      exit 1
+    fi
+    log "warning: could not create $mt_marker" ;;
+esac
+kill_point after-marker
+
+# Only a marker this run wrote, unchanged, may be removed (see mt_mine).
+release_marker() { [ "$own_marker" = 1 ] && mt_rm_mine; return 0; }
+
+# force-repair is consumed last: the guard already records the request.
+rm -f "$force"
+kill_point after-force
 
 fail_closed() {
-  printf '%s %s\n' "$current" "$1" > "$blocked" || log "warning: could not write $blocked"
+  # The guard goes only once the block is durable: if the block cannot be
+  # written, keep the guard and fail, so the next start sees an interruption
+  # instead of running Doctor again.
+  if ! write_block "$current" "$1"; then
+    log "cannot write $blocked; keeping $inprog so the next start does not run Doctor again"
+    release_marker
+    exit 1
+  fi
+  rm -f "$inprog"
+  release_marker
   log "refusing to start the gateway on unrepaired state: $1"
-  log "the container stays up. Inspect the log above, fix the cause, then: touch $force && openclaw gateway start"
+  log "the container stays up. Inspect the log above, fix the cause, then: $retry"
   exit 1
 }
 
+# kill_child: TERM the whole process group (Doctor spawns npm and node
+# children), then KILL whatever is left after a grace period.
+kill_child() {
+  pg=$(sed 's/^.*) //' "/proc/$child/stat" 2>/dev/null | cut -d' ' -f3)
+  tgt=$child
+  [ "$pg" = "$child" ] && tgt=-$child
+  kill -s TERM -- "$tgt" 2>/dev/null
+  i=0
+  while mt_running "$child" && [ "$i" -lt 10 ]; do sleep 1; i=$((i + 1)); done
+  kill -s KILL -- "$tgt" 2>/dev/null
+  return 0
+}
+
+log "running doctor --fix ($reason)"
+case "${OPENCLAW_SYSTEMD_TEST_SIMULATE:-}" in
+  # Test hooks only: exercise the decision logic without running Doctor.
+  ok) set -- sh -c 'echo "simulated doctor: ok"; exit 0' ;;
+  fail) set -- sh -c 'echo "simulated doctor: failure"; exit 1' ;;
+  silent) set -- sleep 3600 ;;
+  chatty) set -- sh -c 'while :; do echo "simulated doctor: working"; sleep 1; done' ;;
+  *) set -- env OPENCLAW_SERVICE_REPAIR_POLICY=external \
+       /usr/local/bin/node /app/openclaw.mjs doctor --fix --non-interactive ;;
+esac
+
+# Doctor's output goes to a file we can watch for progress, and is forwarded to
+# the container log as it grows. It also stays on disk for the post-mortem.
+: > "$doclog" || { log "cannot write $doclog"; fail_closed "cannot write $doclog ($reason)"; }
+stop_sig=
+trap 'stop_sig=1' TERM INT HUP
+# A fresh session and process group, so the whole tree can be signalled.
+if command -v setsid >/dev/null 2>&1; then
+  setsid "$@" > "$doclog" 2>&1 < /dev/null &
+else
+  "$@" > "$doclog" 2>&1 < /dev/null &
+fi
+child=$!
+# --pid: the forwarder dies with this script even if it is killed outright.
+tail -c +1 -f --pid="$$" "$doclog" 2>/dev/null &
+fwd=$!
+
+killed=
+last_size=0
+last_progress=$start
+last_beat=$start
+while mt_running "$child"; do
+  sleep "$TICK_SECS"
+  now=$(date +%s)
+  size=$(wc -c < "$doclog" 2>/dev/null || echo 0)
+  if [ "$size" != "$last_size" ]; then last_size=$size; last_progress=$now; fi
+  if [ $((now - last_beat)) -ge "$HEARTBEAT_SECS" ]; then
+    [ "$own_marker" = 1 ] && { mt_touch_mine || own_marker=0; }
+    last_beat=$now
+  fi
+  if [ -n "$stop_sig" ]; then
+    killed="terminated by signal while repairing"
+  elif [ "$now" -ge "$deadline" ]; then
+    killed="hit the ${HARD_CAP_SECS}s hard cap"
+  elif [ $((now - last_progress)) -ge "$PROGRESS_SECS" ]; then
+    killed="no output for ${PROGRESS_SECS}s"
+  fi
+  if [ -n "$killed" ]; then kill_child; break; fi
+done
+wait "$child" 2>/dev/null
+rc=$?
+[ -n "$killed" ] && rc=124
+[ "$own_marker" = 1 ] && { mt_touch_mine || own_marker=0; }
+sleep 1
+kill "$fwd" 2>/dev/null
+wait "$fwd" 2>/dev/null
+trap - TERM INT HUP
+if [ -n "$killed" ]; then
+  log "doctor killed: $killed"
+else
+  log "doctor exited $rc after $(( $(date +%s) - start ))s"
+fi
+
+# Being stopped mid-Doctor is an interruption in EVERY mode: Doctor may have
+# died half-way, so write the block durably (fail_closed keeps the guard if it
+# cannot) and exit non-zero. Never drop the guard without the block, and never
+# fall through to starting the gateway.
+if [ -n "$stop_sig" ]; then
+  fail_closed "repair interrupted by a stop request ($reason)"
+fi
+
 if [ "$rc" -eq 0 ]; then
+  # Doctor succeeded. Say so in the guard FIRST: from here a kill is recovered
+  # by finishing the repair (see the recovery branch), never by another Doctor
+  # and never by the failed-start logic. The guard stays until the very end.
+  # If this write fails the guard still says "running", so a kill is a block.
+  kill_point after-doctor-ok
+  write_guard doctor_ok=1 || log "warning: could not record the Doctor result in $inprog"
+  kill_point after-doctor-mark
   if ! { echo "$current" > "$stamp.tmp" && mv -f "$stamp.tmp" "$stamp"; }; then
     rm -f "$stamp.tmp" 2>/dev/null
     if [ "$mode" = closed ]; then
@@ -129,6 +415,7 @@ if [ "$rc" -eq 0 ]; then
     fi
     log "warning: doctor succeeded but $stamp could not be written"
   fi
+  kill_point after-stamp
   rm -f "$force" "$blocked"
   # Arm failed-start detection for the start that follows this repair. A
   # forced or upgrade repair starts a fresh attempt budget; a failed-start
@@ -136,13 +423,28 @@ if [ "$rc" -eq 0 ]; then
   if [ "$mode" = closed ] || [ ! -e "$pending" ]; then
     echo 0 > "$pending" || log "warning: could not arm $pending"
   fi
+  kill_point before-handover
+  # Repair is done but the gateway is not up yet. Keep the window open, now
+  # bounded by the unit's invocation and a deadline instead of this process;
+  # mark-healthy removes it once /readyz answers.
+  if [ "$own_marker" = 1 ]; then
+    mt_write awaiting-ready "$reason" "" "$start" "$(( $(date +%s) + READY_SECS ))" guard \
+      || log "warning: could not hand $mt_marker over to the readiness wait"
+  fi
+  kill_point after-handover
+  rm -f "$inprog"
   log "state repaired for $current"
   exit 0
 fi
 
 if [ "$mode" = closed ]; then
+  if [ -n "$killed" ]; then
+    fail_closed "doctor killed: $killed ($reason)"
+  fi
   fail_closed "doctor exited $rc ($reason)"
 fi
 
+rm -f "$inprog"
+release_marker
 log "doctor failed; starting anyway because this was a failed-start repair"
 exit 0

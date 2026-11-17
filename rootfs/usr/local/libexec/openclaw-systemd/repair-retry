@@ -1,0 +1,94 @@
+#!/bin/sh
+# The one operator retry path after a repair was blocked or interrupted:
+#
+#   kubectl exec -it <pod> -c app -- /usr/local/libexec/openclaw-systemd/repair-retry
+#
+# It clears repair-blocked and any dead repair-in-progress record, removes a
+# stale maintenance marker this lifecycle left, arms force-repair, and starts
+# the gateway, whose start then runs Doctor once under the same watched
+# window as any other repair. Nobody should hand-create a marker or edit a
+# unit timeout; that is what this replaces.
+#
+# Works as root (kubectl exec lands there) and as uid 1000. As root it
+# re-executes itself as the state owner (uid 1000) for every state and lock
+# operation, so it can never leave a root-owned lock, force-repair or record
+# that the gateway account then cannot open; only the final gateway start goes
+# through the `openclaw` wrapper as root, which hands off to uid 1000 itself.
+# The check-and-clear of repair-in-progress runs under the same flock as
+# repair-if-needed's guard write, so a repair that starts concurrently either
+# wrote its guard first (and this refuses) or sees the cleared state. It also
+# refuses while a repair is genuinely still running.
+#
+# This operator command reads no environment-controlled switch at all (root's
+# environment is whatever kubectl exec inherited). Tests stub `openclaw` and
+# `systemctl` through PATH, which only the non-root path honours.
+# --state-only is the internal re-exec (uid 1000 only): state operations, no start.
+set -u
+
+# First thing, before any command lookup: decide root-ness with the absolute
+# id, and for root pin PATH and the loader environment. The inherited PATH of a
+# kubectl exec puts ~/.local/bin (writable by the gateway account) first, so
+# resolving even `getent` or `setpriv` through it would run that account's code
+# as root. The pinned PATH is passed explicitly across the setpriv re-exec too.
+# Non-root runs keep their own PATH: they gain nothing by it, and the tests
+# stub commands that way.
+if [ "$(/usr/bin/id -u)" = 0 ]; then
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+  export PATH
+  is_root=1
+  unset LD_PRELOAD LD_LIBRARY_PATH LD_AUDIT BASH_ENV ENV CDPATH
+else
+  is_root=
+fi
+
+state_only=
+[ "${1:-}" = --state-only ] && state_only=1
+
+if [ -n "$is_root" ]; then
+  if [ -n "$state_only" ]; then
+    echo "repair-retry: --state-only is internal and must not run as root"
+    exit 1
+  fi
+  # The state owner's home comes from its passwd entry, never from the
+  # environment.
+  acct_home=$(getent passwd 1000 | cut -d: -f6)
+  [ -n "$acct_home" ] || acct_home=/home/openclaw
+  setpriv --reuid=1000 --regid=1000 --init-groups -- env \
+    PATH="$PATH" HOME="$acct_home" XDG_RUNTIME_DIR=/run/user/1000 \
+    DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus \
+    "$0" --state-only || exit $?
+  # A unit that hit systemd's start limit refuses to start until reset.
+  setpriv --reuid=1000 --regid=1000 --init-groups -- env \
+    PATH="$PATH" XDG_RUNTIME_DIR=/run/user/1000 \
+    DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus \
+    systemctl --user reset-failed openclaw-gateway.service 2>/dev/null
+  exec openclaw gateway start
+fi
+
+state=${HOME:?HOME not set}/.openclaw/state/openclaw-systemd
+here=$(dirname "$0")
+# shellcheck source=maintenance.sh
+. "$here/maintenance.sh"
+
+mkdir -p "$state" || { echo "repair-retry: cannot create $state"; exit 1; }
+
+mt_lock || { echo "repair-retry: cannot take the state lock"; exit 1; }
+if [ -f "$state/repair-in-progress" ]; then
+  pid=$(mt_field pid "$state/repair-in-progress")
+  if mt_pid_is_owner "$pid" "$(mt_field pidstart "$state/repair-in-progress")"; then
+    mt_unlock
+    echo "repair-retry: a repair is still running (pid $pid); not interfering"
+    exit 1
+  fi
+fi
+rm -f "$state/repair-blocked" "$state/repair-in-progress"
+touch "$state/force-repair" || { mt_unlock; echo "repair-retry: cannot arm $state/force-repair"; exit 1; }
+mt_unlock
+# Only our own stale marker; an operator's marker is not ours to remove.
+mt_reap
+echo "repair-retry: cleared the block and armed a forced repair"
+
+[ -z "$state_only" ] || exit 0
+
+systemctl --user reset-failed openclaw-gateway.service 2>/dev/null
+exec openclaw gateway start

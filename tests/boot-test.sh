@@ -75,6 +75,16 @@ wait_pending_cleared() {
   echo "start-pending was never cleared after the gateway became healthy"; return 1
 }
 
+# The repair's maintenance marker is removed by mark-healthy once /readyz
+# answers, and never left behind for the next start.
+wait_marker_cleared() {
+  for _ in $(seq 1 60); do
+    docker exec boot test ! -e /home/openclaw/.openclaw/MAINTENANCE && return 0
+    sleep 1
+  done
+  echo "the maintenance marker was never removed after the gateway became ready"; return 1
+}
+
 halt() {
   local start code logs
   start=$(date +%s)
@@ -101,6 +111,8 @@ docker exec boot sh -ec '
   test "$(stat -c %U $st/repaired-version)" = node
 '
 wait_pending_cleared
+wait_marker_cleared
+docker exec boot test ! -e /home/openclaw/.openclaw/state/openclaw-systemd/repair-in-progress
 status=$(docker exec boot oc gateway status)
 printf '%s\n' "$status"
 if grep -q "Service config issue" <<<"$status"; then
@@ -331,7 +343,7 @@ echo "== a fail-closed repair holds the gateway down but keeps the container liv
 # refuse to start, systemd's automatic restarts must not re-run Doctor, and
 # once the unit gives up the liveness probe must still pass so Kubernetes does
 # not restart-loop the container.
-as_node systemctl --user set-environment OPENCLAW_SYSTEMD_REPAIR_SIMULATE=fail
+as_node systemctl --user set-environment OPENCLAW_SYSTEMD_TEST_SIMULATE=fail
 docker exec boot sh -ec '
   st=/home/openclaw/.openclaw/state/openclaw-systemd
   touch $st/force-repair; chown 1000:1000 $st/force-repair
@@ -346,6 +358,8 @@ test -n "$held" || { printf '%s\n' "$out"; echo "probe never reported the repair
 test "$(as_node systemctl --user is-failed openclaw-gateway.service)" = failed
 if docker exec boot openclaw-probe-ready; then echo "gateway answering despite a failed repair"; exit 1; fi
 docker exec boot test -f /home/openclaw/.openclaw/state/openclaw-systemd/repair-blocked
+docker exec boot test ! -e /home/openclaw/.openclaw/MAINTENANCE
+docker exec boot test ! -e /home/openclaw/.openclaw/state/openclaw-systemd/repair-in-progress
 test "$(count_log 'repair: running doctor --fix (forced')" = 1
 # A further start (as after a pod restart) fails fast on the block: Doctor
 # does not run again, and the container is still live.
@@ -357,13 +371,24 @@ test "$(count_log 'repair: running doctor --fix (forced')" = 1
 docker exec boot openclaw-probe-live
 
 echo "== retry after fixing the cause: newer force-repair, then start"
-as_node systemctl --user unset-environment OPENCLAW_SYSTEMD_REPAIR_SIMULATE
+as_node systemctl --user unset-environment OPENCLAW_SYSTEMD_TEST_SIMULATE
+# As root, with a hostile PATH that puts a writable directory first (as a
+# kubectl exec's PATH does with ~/.local/bin): none of the planted commands may
+# run, because repair-retry pins PATH before any lookup.
+docker exec boot sh -ec '
+  rm -rf /tmp/evil; mkdir /tmp/evil; chown 1000:1000 /tmp/evil
+  for c in getent setpriv env systemctl openclaw cut dirname id sed head cat touch rm mkdir flock date; do
+    printf "#!/bin/sh\ntouch /tmp/evil/ran\nexit 99\n" > /tmp/evil/$c; chmod 755 /tmp/evil/$c
+  done
+'
+docker exec -e PATH=/tmp/evil:/usr/local/bin:/usr/bin:/bin boot /usr/local/libexec/openclaw-systemd/repair-retry
+docker exec boot test ! -e /tmp/evil/ran
+# Run as root, it must leave nothing root-owned in the state directory.
 docker exec boot sh -ec '
   st=/home/openclaw/.openclaw/state/openclaw-systemd
-  touch $st/force-repair; chown 1000:1000 $st/force-repair
+  test -z "$(find $st ! -user node)"
+  test "$(stat -c %U $st/maintenance.lock)" = node
 '
-as_node systemctl --user reset-failed openclaw-gateway.service
-docker exec boot oc gateway start
 wait_ready
 docker exec boot sh -ec '
   st=/home/openclaw/.openclaw/state/openclaw-systemd
@@ -371,6 +396,7 @@ docker exec boot sh -ec '
 '
 test "$(count_log 'repair: running doctor --fix (forced')" = 2
 wait_pending_cleared
+wait_marker_cleared
 docker exec boot openclaw-probe-live
 
 echo "== bind mount re-applies on a fresh /run after restart"
