@@ -44,6 +44,9 @@ jobs:
       - name: Static checks
         run: docker run --rm --entrypoint sh -v "$PWD/tests:/tests:ro" openclaw-systemd:ci /tests/static-checks.sh
 
+      - name: Temp permission regression tests
+        run: docker run --rm --entrypoint node -v "$PWD:/source:ro" openclaw-systemd:ci --test /source/tests/temp-permissions.test.mjs
+
       - name: Boot test (systemd PID 1, native gateway lifecycle)
         run: tests/boot-test.sh openclaw-systemd:ci
 
