@@ -56,9 +56,11 @@ if [ -d /etc/openclaw-systemd/units ]; then
   done
 fi
 
-# 5. The user unit directory must not be group- or world-writable, but
-#    fsGroup makes the home 2775. Only the unit directory chain is fixed; the
-#    home root is left exactly as kubelet sets it.
+# 5. fsGroup can restore 2775 on PVC ancestors on every pod creation.
+#    Repair known temp ancestors before Doctor/user-manager startup, retaining
+#    shared access and setgid while preventing sibling replacement.
+node /usr/local/libexec/openclaw-systemd/prepare-temp-ancestors.mjs
+# The user unit directory itself must not be group- or world-writable.
 install -d -o node -g node -m 0755 $HOME_DIR/.config $HOME_DIR/.config/systemd
 install -d -o node -g node -m 0700 $HOME_DIR/.config/systemd/user
 
