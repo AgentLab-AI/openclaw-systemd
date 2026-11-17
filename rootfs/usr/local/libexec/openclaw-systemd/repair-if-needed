@@ -129,9 +129,28 @@ if [ -f "$inprog" ]; then
     # finishing: the repair is done, so finish it here without Doctor, and
     # without letting the failed-start logic below pick another repair.
     log "an earlier repair finished Doctor but was killed before it completed; completing it without running Doctor"
+    gstart=$(mt_field start "$inprog"); ginv=$(mt_field invocation "$inprog"); gps=$(mt_field pidstart "$inprog")
+    # Test hook only: pause before the recovery lock (see HOLD_FILE below).
+    if [ -n "${OPENCLAW_SYSTEMD_TEST_HOLD_FILE:-}" ]; then
+      : > "$OPENCLAW_SYSTEMD_TEST_HOLD_FILE.reached"
+      while [ -e "$OPENCLAW_SYSTEMD_TEST_HOLD_FILE" ]; do sleep 0.1; done
+    fi
+    # Everything that completes the repair happens under ONE lock, after
+    # re-reading the guard: a second start that read the same dead guard
+    # arrives late, finds it gone (or no longer dead-doctor_ok), and does
+    # nothing destructive: no stamp, pending or marker changes.
+    mt_lock || { log "cannot take the state lock; recovery will be retried by the next start"; exit 1; }
+    if [ ! -f "$inprog" ] || [ "$(mt_field doctor_ok "$inprog")" != 1 ] \
+       || [ "$(mt_field pid "$inprog")" != "$ipid" ] || [ "$(mt_field start "$inprog")" != "$gstart" ] \
+       || mt_pid_is_owner "$ipid" "$gps"; then
+      mt_unlock
+      log "another start already completed (or is completing) that repair; nothing to do"
+      exit 0
+    fi
     if [ "$iversion" = "$current" ] && [ "$(cat "$stamp" 2>/dev/null)" != "$current" ]; then
       if ! { echo "$current" > "$stamp.tmp" && mv -f "$stamp.tmp" "$stamp"; }; then
         rm -f "$stamp.tmp" 2>/dev/null
+        mt_unlock
         log "cannot write $stamp; keeping $inprog so the next start still sees it"
         exit 1
       fi
@@ -140,14 +159,17 @@ if [ -f "$inprog" ]; then
       rm -f "$force" "$blocked"
       echo 0 > "$pending" || log "warning: could not arm $pending"
     fi
-    # The dead run's marker was reaped above, and the gateway is about to
-    # start: cover that start with a fresh awaiting-ready marker for THIS
-    # invocation, so the startup probe stays satisfied until /readyz and
-    # mark-healthy has something to remove. Created only if none exists.
-    mt_drop_awaiting
-    mt_write awaiting-ready "$ireason" "" "$(date +%s)" "$(( $(date +%s) + READY_SECS ))" create
-    [ $? = 1 ] && log "warning: could not create $mt_marker for the readiness wait"
-    rm -f "$inprog"
+    # The gateway is about to start: cover that start with this start's
+    # awaiting-ready marker (see mt_recover_marker for what it may replace) so
+    # the startup probe stays satisfied until /readyz and mark-healthy has
+    # something to remove. The guard goes last, still inside the lock: if the
+    # marker cannot be written the guard stays and the next start retries.
+    if mt_recover_marker "$ireason" "$(( $(date +%s) + READY_SECS ))" "$ipid" "$gps" "$ginv" "$gstart"; then
+      rm -f "$inprog"
+    else
+      log "warning: could not create $mt_marker for the readiness wait; keeping $inprog for the next start"
+    fi
+    mt_unlock
     exit 0
   fi
   # Any mode: a dead guard without doctor_ok means Doctor may have died

@@ -86,11 +86,12 @@ mt_expect=
 mt_mine() { [ -n "$mt_expect" ] && [ "$(mt_ident)" = "$mt_expect" ]; }
 mt_changed() { echo "maintenance: $mt_marker belongs to another run now; left alone"; return 1; }
 
-# mt_write <phase> <reason> <pid> <start> <deadline> [guard|create]
-#   guard   the marker on disk must still be ours
-#   create  the marker must not exist; returns 2 if one does
-# Both checks and the rename happen under the lock.
-mt_write() {
+# _mt_put <phase> <reason> <pid> <start> <deadline> <mode>: write the marker
+# atomically (tmp + mv). The CALLER HOLDS THE LOCK. Modes:
+#   guard    the marker on disk must still be ours
+#   create   the marker must not exist; returns 2 if one does
+#   replace  unconditional (the caller has already matched what it replaces)
+_mt_put() {
   _mt_reason=$(printf '%s' "$2" | tr '\n\r' '  ')
   _mt_ps=
   [ -n "$3" ] && _mt_ps=$(mt_pidstart "$3")
@@ -106,7 +107,6 @@ mt_write() {
     echo "start=$4"
     echo "deadline=$5"
   } > "$_mt_tmp" || { rm -f "$_mt_tmp" 2>/dev/null; return 1; }
-  mt_lock || { rm -f "$_mt_tmp"; return 1; }
   _mt_rc=0
   if [ "${6:-}" = guard ] && ! mt_mine; then
     mt_changed; _mt_rc=1
@@ -117,9 +117,41 @@ mt_write() {
   else
     _mt_rc=1
   fi
-  mt_unlock
   rm -f "$_mt_tmp" 2>/dev/null
   return $_mt_rc
+}
+
+# mt_write <phase> <reason> <pid> <start> <deadline> [guard|create]
+mt_write() {
+  mt_lock || return 1
+  _mt_put "$1" "$2" "$3" "$4" "$5" "${6:-replace}"; _mtw=$?
+  mt_unlock
+  return $_mtw
+}
+
+# mt_recover_marker <reason> <deadline> <dead pid> <dead pidstart> <dead
+# invocation> <dead start>: finishing a repair that died after Doctor
+# succeeded. The CALLER HOLDS THE LOCK. Puts this start's awaiting-ready marker
+# in place, replacing a marker only if it is the dead run's (our owner tag and
+# either its repair identity pid/pidstart/invocation, or its awaiting-ready
+# identity invocation/start); creating one if none exists; and leaving anything
+# else alone (a live run's, an operator's, or one a later recovery already
+# wrote, whose start differs). Returns 0 if a marker of ours is now in place or
+# was deliberately left, 1 on a write error.
+mt_recover_marker() {
+  if [ ! -e "$mt_marker" ]; then
+    _mt_put awaiting-ready "$1" "" "$(date +%s)" "$2" create; [ $? != 1 ]; return
+  fi
+  if mt_owned; then
+    _rp=$(mt_field pid); _rps=$(mt_field pidstart); _ri=$(mt_field invocation)
+    _rs=$(mt_field start); _rph=$(mt_field phase)
+    if { [ "$_rph" = repair ] && [ "$_rp" = "$3" ] && [ "$_rps" = "$4" ] && [ "$_ri" = "$5" ]; } \
+       || { [ "$_rph" = awaiting-ready ] && [ "$_ri" = "$5" ] && [ "$_rs" = "$6" ]; }; then
+      _mt_put awaiting-ready "$1" "" "$(date +%s)" "$2" replace; [ $? != 1 ]; return
+    fi
+  fi
+  echo "maintenance: $mt_marker is not the interrupted run's; left alone"
+  return 0
 }
 
 # Keep the probe's mtime window fresh, only on a marker that is still ours.
@@ -153,31 +185,16 @@ mt_stale() {
     repair)
       mt_pid_is_owner "$(mt_field pid)" "$(mt_field pidstart)" || return 0 ;;
     awaiting-ready)
-      # Differing invocations, including one side being empty (a marker
-      # written without an InvocationID, or read without one): the readiness
-      # wait it described belongs to an earlier start. Only two empty IDs
-      # (no systemd at all) cannot be told apart.
+      # Only two distinct NON-EMPTY IDs prove an earlier start. An empty ID
+      # on either side proves nothing: repair-retry runs outside systemd with
+      # none, and must never reap a live handed-over marker.
       _mi=$(mt_field invocation)
-      if [ "$_mi" != "${INVOCATION_ID:-}" ]; then
+      if [ -n "$_mi" ] && [ -n "${INVOCATION_ID:-}" ] && [ "$_mi" != "$INVOCATION_ID" ]; then
         return 0
       fi ;;
     *) return 0 ;;
   esac
   return 1
-}
-
-# mt_drop_awaiting: remove our own awaiting-ready marker whatever its
-# invocation. Recovery of a finished-but-killed repair uses it: the guard's
-# owner is dead, so any awaiting-ready marker is a leftover of that run, and the
-# start now beginning needs its own (stale detection alone cannot tell two runs
-# apart when neither has an InvocationID).
-mt_drop_awaiting() {
-  mt_lock || return 1
-  if mt_owned && [ "$(mt_field phase)" = awaiting-ready ]; then
-    rm -f "$mt_marker"
-    echo "maintenance: replaced the awaiting-ready marker left by the interrupted run"
-  fi
-  mt_unlock
 }
 
 # Decision point: drop our own marker if stale. Says so, so a leftover from a

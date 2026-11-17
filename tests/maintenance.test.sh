@@ -462,6 +462,51 @@ fresh; echo 0 > "$st/start-pending"
 killed_at after-doctor-ok
 expect_blocked_no_doctor "open/after-doctor-ok"
 
+echo "== recovery replaces only the interrupted run's marker, under one lock"
+# (a) repair-retry runs outside systemd with no InvocationID: an empty ID proves
+# nothing, so it must not reap a live handed-over marker.
+fresh; now=$(date +%s)
+printf 'owner=openclaw-systemd\nphase=awaiting-ready\npid=\npidstart=\ninvocation=live-run\nreason=r\nstart=%s\ndeadline=%s\n' "$now" $((now + 3600)) > "$mk"
+env -u INVOCATION_ID HOME=$H PATH=$t/rtbin:$PATH "$rt" >/dev/null || die "retry failed"
+[ "$(field invocation)" = live-run ] || die "repair-retry (no InvocationID) removed a live awaiting-ready marker"
+# (b) two recoveries read the same dead doctor_ok guard; the late one must find
+# the work done and touch nothing.
+fresh; touch "$st/force-repair"
+killed_at after-handover
+: > "$t/holdA"; : > "$t/holdB"; rm -f "$t/holdA.reached" "$t/holdB.reached" "$t/rcA" "$t/rcB"
+( rc=0; rr fail INVOCATION_ID=inv-A OPENCLAW_SYSTEMD_TEST_HOLD_FILE="$t/holdA" >"$t/outA" 2>&1 || rc=$?; echo $rc > "$t/rcA" ) &
+( rc=0; rr fail INVOCATION_ID=inv-B OPENCLAW_SYSTEMD_TEST_HOLD_FILE="$t/holdB" >"$t/outB" 2>&1 || rc=$?; echo $rc > "$t/rcB" ) &
+waitfor "$t/holdA.reached" 10 && waitfor "$t/holdB.reached" 10 || die "both recoveries must have read the guard"
+rm -f "$t/holdA"
+waitfor "$t/rcA" 15 || die "recovery A did not finish"
+[ "$(cat "$t/rcA")" = 0 ] && [ "$(field invocation)" = inv-A ] && [ "$(field phase)" = awaiting-ready ] || die "recovery A: marker/exit"
+[ ! -e "$st/repair-in-progress" ] || die "recovery A left the guard"
+# The gateway became healthy meanwhile: mark-healthy cleared failed-start state.
+rm -f "$st/start-pending"; cp "$mk" "$t/marker.after-A"
+rm -f "$t/holdB"
+waitfor "$t/rcB" 15 || die "recovery B did not finish"
+[ "$(cat "$t/rcB")" = 0 ] || die "recovery B must exit 0"
+cmp -s "$mk" "$t/marker.after-A" || die "the late recovery changed the winner's marker"
+[ ! -e "$st/start-pending" ] || die "the late recovery re-armed failed-start detection"
+grep -q 'nothing to do' "$t/outB" || die "late recovery did not report that it had nothing to do: $(cat "$t/outB")"
+# (c) the leftover marker of the killed run, with no InvocationIDs at all, is
+# replaced by this start's marker (the CI case).
+fresh; touch "$st/force-repair"
+env -u INVOCATION_ID HOME=$H OPENCLAW_SYSTEMD_TEST_SIMULATE=ok OPENCLAW_SYSTEMD_TEST_KILL_AT=after-handover "$r" openclaw-gateway.service >/dev/null 2>&1 || true
+[ -z "$(field invocation)" ] && [ "$(field phase)" = awaiting-ready ] || die "setup: expected the killed run's empty-ID marker"
+out=$(env -u INVOCATION_ID HOME=$H OPENCLAW_SYSTEMD_TEST_SIMULATE=fail INVOCATION_ID=inv-new "$r" openclaw-gateway.service 2>&1) || die "empty-ID recovery failed: $out"
+[ "$(field invocation)" = inv-new ] || die "empty-ID leftover marker was not replaced"
+# A marker that is not the dead run's (an operator's, a live run's) is left alone.
+mkguard_done() { printf 'version=%s\nmode=closed\nreason=r\npid=%s\npidstart=\ninvocation=gone\nstart=100\ndoctor_ok=1\n' "$v" "$deadpid" > "$st/repair-in-progress"; }
+fresh; mkguard_done; printf 'hand made\n' > "$mk"
+out=$(rr fail INVOCATION_ID=inv-x 2>&1) || die "recovery over an operator marker failed"
+[ "$(cat "$mk")" = 'hand made' ] && [ ! -e "$st/repair-in-progress" ] || die "operator marker touched, or guard kept"
+echo "$out" | grep -q 'left alone' || die "foreign marker not reported"
+fresh; mkguard_done
+printf 'owner=openclaw-systemd\nphase=repair\npid=%s\npidstart=\ninvocation=other\nreason=r\nstart=555\ndeadline=%s\n' $$ $((now + 3600)) > "$mk"
+rr fail INVOCATION_ID=inv-x >/dev/null 2>&1 || die "recovery over a live run's marker failed"
+[ "$(field invocation)" = other ] && [ ! -e "$st/repair-in-progress" ] || die "a live run's marker was replaced"
+
 echo "== fail_closed keeps the guard whenever the block cannot be written"
 fresh; touch "$st/force-repair"
 mkdir "$st/repair-blocked"
