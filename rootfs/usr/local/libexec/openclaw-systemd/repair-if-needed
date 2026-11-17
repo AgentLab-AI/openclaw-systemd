@@ -144,6 +144,7 @@ if [ -f "$inprog" ]; then
     # start: cover that start with a fresh awaiting-ready marker for THIS
     # invocation, so the startup probe stays satisfied until /readyz and
     # mark-healthy has something to remove. Created only if none exists.
+    mt_drop_awaiting
     mt_write awaiting-ready "$ireason" "" "$(date +%s)" "$(( $(date +%s) + READY_SECS ))" create
     [ $? = 1 ] && log "warning: could not create $mt_marker for the readiness wait"
     rm -f "$inprog"

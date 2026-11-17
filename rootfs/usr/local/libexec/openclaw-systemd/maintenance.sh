@@ -153,13 +153,31 @@ mt_stale() {
     repair)
       mt_pid_is_owner "$(mt_field pid)" "$(mt_field pidstart)" || return 0 ;;
     awaiting-ready)
+      # Differing invocations, including one side being empty (a marker
+      # written without an InvocationID, or read without one): the readiness
+      # wait it described belongs to an earlier start. Only two empty IDs
+      # (no systemd at all) cannot be told apart.
       _mi=$(mt_field invocation)
-      if [ -n "$_mi" ] && [ -n "${INVOCATION_ID:-}" ] && [ "$_mi" != "$INVOCATION_ID" ]; then
+      if [ "$_mi" != "${INVOCATION_ID:-}" ]; then
         return 0
       fi ;;
     *) return 0 ;;
   esac
   return 1
+}
+
+# mt_drop_awaiting: remove our own awaiting-ready marker whatever its
+# invocation. Recovery of a finished-but-killed repair uses it: the guard's
+# owner is dead, so any awaiting-ready marker is a leftover of that run, and the
+# start now beginning needs its own (stale detection alone cannot tell two runs
+# apart when neither has an InvocationID).
+mt_drop_awaiting() {
+  mt_lock || return 1
+  if mt_owned && [ "$(mt_field phase)" = awaiting-ready ]; then
+    rm -f "$mt_marker"
+    echo "maintenance: replaced the awaiting-ready marker left by the interrupted run"
+  fi
+  mt_unlock
 }
 
 # Decision point: drop our own marker if stale. Says so, so a leftover from a
