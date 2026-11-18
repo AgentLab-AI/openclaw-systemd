@@ -78,7 +78,27 @@ test -x /usr/local/libexec/openclaw-systemd/mark-healthy
 test ! -e /etc/systemd/user/openclaw-gateway.service.d
 grep -qx "ExecStartPre=$r %n" "$d"
 grep -q '^ExecStartPost=-.*mark-healthy %n &' "$d"
-grep -qx 'TimeoutStartSec=15min' "$d"
+grep -qx 'TimeoutStartSec=200min' "$d"
+! grep -q 'EXTEND_TIMEOUT_USEC\|NotifyAccess' "$d"
+test -f /usr/local/libexec/openclaw-systemd/maintenance.sh
+# The marker lock needs util-linux's flock.
+command -v flock >/dev/null
+# Test hooks (all OPENCLAW_SYSTEMD_TEST_*) must not propagate from the pod
+# environment into the user manager.
+env -i PATH=/usr/bin:/bin OPENCLAW_SYSTEMD_TEST_SIMULATE=ok OPENCLAW_SYSTEMD_TEST_KILL_AT=after-guard \
+  OPENCLAW_SYSTEMD_TEST_HOLD_FILE=/x OPENCLAW_SYSTEMD_TEST_TICK=1 KEEP=1 \
+  /usr/local/bin/node /usr/local/libexec/openclaw-systemd/write-env-file.mjs /tmp/hk
+! grep -q 'OPENCLAW_SYSTEMD_TEST_' /tmp/hk
+grep -qx 'KEEP="1"' /tmp/hk
+grep -q 'OPENCLAW_SYSTEMD_TEST_' /usr/local/libexec/openclaw-systemd/write-env-file.mjs
+! grep -q 'OPENCLAW_SYSTEMD_ACCOUNT_HOME\|OPENCLAW_SYSTEMD_TEST_' /usr/local/libexec/openclaw-systemd/repair-retry
+# repair-retry decides root-ness with the absolute id and pins PATH for root first.
+grep -q '"\$(/usr/bin/id -u)" = 0' /usr/local/libexec/openclaw-systemd/repair-retry
+grep -qxF '  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' /usr/local/libexec/openclaw-systemd/repair-retry
+# repair-retry as root re-executes as uid 1000 for state/lock work (no root-owned lock).
+grep -q '"\$0" --state-only' /usr/local/libexec/openclaw-systemd/repair-retry
+! grep -q chown /usr/local/libexec/openclaw-systemd/repair-retry
+test -x /usr/local/libexec/openclaw-systemd/repair-retry
 grep -q 'OPENCLAW_SERVICE_REPAIR_POLICY=external' "$r"
 grep -q 'state/openclaw-systemd}' /usr/local/bin/openclaw-probe-live
 grep -q '$state/repair-blocked' /usr/local/bin/openclaw-probe-live
@@ -88,15 +108,15 @@ grep -q 'openclaw.mjs doctor --fix --non-interactive' "$r"
 
 v=$(/usr/local/bin/node -p 'require("/app/package.json").version')
 st=/tmp/rh/.openclaw/state/openclaw-systemd
-rr() { HOME=/tmp/rh OPENCLAW_SYSTEMD_REPAIR_SIMULATE=$1 "$r" openclaw-gateway.service; }
+rr() { HOME=/tmp/rh OPENCLAW_SYSTEMD_TEST_SIMULATE=$1 "$r" openclaw-gateway.service; }
 fresh() { rm -rf /tmp/rh; mkdir -p "$st"; }
 
 # The drop-in applies to every user service: anything but the gateway is a
 # silent no-op, even with a repair forced and a failing Doctor.
 fresh; touch "$st/force-repair"
-out=$(HOME=/tmp/rh OPENCLAW_SYSTEMD_REPAIR_SIMULATE=fail "$r" dbus.service)
+out=$(HOME=/tmp/rh OPENCLAW_SYSTEMD_TEST_SIMULATE=fail "$r" dbus.service)
 test -z "$out"
-out=$(HOME=/tmp/rh OPENCLAW_SYSTEMD_REPAIR_SIMULATE=fail "$r")
+out=$(HOME=/tmp/rh OPENCLAW_SYSTEMD_TEST_SIMULATE=fail "$r")
 test -z "$out"
 test -e "$st/force-repair"
 test ! -e "$st/repaired-version"
@@ -157,10 +177,13 @@ if rr ok >/dev/null; then echo "unwritable stamp must fail closed"; exit 1; fi
 test -e "$st/repair-blocked"
 rmdir "$st/repaired-version.tmp"
 
-# Forced repair fails closed and keeps the request for the retry.
+# Forced repair fails closed. The request is consumed into the in-progress
+# record before Doctor runs, so a killed repair cannot re-trigger itself; the
+# retry (repair-retry) arms a new one.
 fresh; echo "$v" > "$st/repaired-version"; touch "$st/force-repair"
 if rr fail >/dev/null; then echo "failed forced repair must fail closed"; exit 1; fi
-test -e "$st/force-repair"
+test ! -e "$st/force-repair"
+test ! -e "$st/repair-in-progress"
 test -e "$st/repair-blocked"
 
 # Failed start: repairs, fails open, counts attempts, stops at the cap.

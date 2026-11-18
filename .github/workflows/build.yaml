@@ -44,6 +44,11 @@ jobs:
       - name: Static checks
         run: docker run --rm --entrypoint sh -v "$PWD/tests:/tests:ro" openclaw-systemd:ci /tests/static-checks.sh
 
+      - name: Maintenance window tests
+        # Not root: the suite relies on real permission checks (a chmod 555
+        # directory must refuse writes) and refuses to run as uid 0.
+        run: docker run --rm --user 1000:1000 --entrypoint sh -e TMPDIR=/tmp -e LIBEXEC=/usr/local/libexec/openclaw-systemd -v "$PWD/tests:/tests:ro" openclaw-systemd:ci /tests/maintenance.test.sh
+
       - name: Temp permission regression tests
         run: docker run --rm --entrypoint node -v "$PWD:/source:ro" openclaw-systemd:ci --test /source/tests/temp-permissions.test.mjs
 

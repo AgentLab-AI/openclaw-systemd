@@ -14,11 +14,19 @@ const EXCLUDE = new Set([
   "PWD", "OLDPWD", "SHLVL", "_", "container", "HOSTNAME", "TERM",
 ]);
 
+// Test hooks of the repair lifecycle (simulated Doctor, kill points, shortened
+// deadlines) all use this prefix and must never be reachable from the pod's
+// environment: the env file feeds the user manager, so a stray
+// OPENCLAW_SYSTEMD_TEST_SIMULATE=ok would skip Doctor yet stamp the version
+// repaired. Tests set them directly on the process, or through
+// `systemctl --user set-environment`, never through this file.
+const TEST_HOOK_PREFIX = "OPENCLAW_SYSTEMD_TEST_";
+
 const quote = (v) => '"' + v.replace(/[\\"`$]/g, (c) => "\\" + c) + '"';
 
 const lines = Object.entries(process.env)
   .filter(([k]) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(k))
-  .filter(([k]) => !EXCLUDE.has(k) && !k.startsWith("KUBERNETES_"))
+  .filter(([k]) => !EXCLUDE.has(k) && !k.startsWith("KUBERNETES_") && !k.startsWith(TEST_HOOK_PREFIX))
   .sort(([a], [b]) => a.localeCompare(b))
   .map(([k, v]) => `${k}=${quote(v)}`);
 

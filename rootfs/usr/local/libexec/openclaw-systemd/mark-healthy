@@ -1,25 +1,86 @@
 #!/bin/sh
 # Started detached by ExecStartPost from
 # /etc/systemd/user/service.d/10-openclaw-gateway-repair.conf; $1 is the unit
-# name (%n) and anything other than the gateway returns immediately. Waits for
-# the gateway to answer /healthz, then clears the start-pending marker that
-# repair-if-needed armed. A start that never gets here leaves the marker, so
-# the next start repairs first.
+# name (%n) and anything other than the gateway returns immediately. Does two
+# things, each on its own condition:
+#
+#   /healthz answers  clear the start-pending marker that repair-if-needed
+#                     armed. A start that never gets here leaves it, so the
+#                     next start repairs first.
+#   /readyz answers   (200) end the maintenance window: remove
+#                     ~/.openclaw/MAINTENANCE if, and only if, this lifecycle
+#                     owns it for this invocation (see maintenance.sh). An
+#                     operator's hand-made marker, or any marker without our
+#                     owner fields, is left and logged. /readyz, not just
+#                     /healthz: the gateway can be alive before its channels
+#                     and plugins are ready, and the window should outlast that.
+#
+# The marker is re-touched while waiting so the Kubernetes startup probe keeps
+# seeing it fresh. If readiness never comes within the window, the marker is
+# released anyway once its deadline passes: an expired marker is stale and
+# must not linger. The gateway's own liveness is the probes' business.
+#
+# Both checks use the gateway's own port; 18790 is a pod sidecar and absent
+# from the image.
 set -u
 
 [ "${1:-}" = openclaw-gateway.service ] || exit 0
 
 state=${HOME:?HOME not set}/.openclaw/state/openclaw-systemd
 port=${OPENCLAW_GATEWAY_PORT:-18789}
-deadline=$(( $(date +%s) + 600 ))
+# Test hook: shorten the wait. Never set in production.
+wait_secs=${OPENCLAW_SYSTEMD_TEST_READY_SECS:-1800}
+tick=${OPENCLAW_SYSTEMD_TEST_TICK:-2}
+here=$(dirname "$0")
+# shellcheck source=maintenance.sh
+. "$here/maintenance.sh"
 
+# Adopt the marker only if it is this lifecycle's awaiting-ready marker for this
+# invocation, taking its full identity snapshot (mt_expect) so the refresh and
+# the removal below re-verify it is still that exact marker. Run-time repair
+# markers (owner still alive) and other runs' markers are not ours to take down.
+ours_to_remove() {
+  _id=$(mt_ident) || return 1
+  IFS='|' read -r _o _ph _pd _ps _iv _st _rest <<EOF2
+$_id
+EOF2
+  [ "$_o" = "$mt_tag" ] && [ "$_ph" = awaiting-ready ] || return 1
+  [ -z "$_iv" ] || [ -z "${INVOCATION_ID:-}" ] || [ "$_iv" = "${INVOCATION_ID:-}" ] || return 1
+  mt_expect=$_id
+}
+
+deadline=$(( $(date +%s) + wait_secs ))
+cleared=
 while [ "$(date +%s)" -lt "$deadline" ]; do
   if curl -sf -m 3 -o /dev/null "http://127.0.0.1:$port/healthz"; then
-    rm -f "$state/start-pending"
-    echo "repair: gateway healthy; cleared start-pending"
-    exit 0
+    if [ -z "$cleared" ]; then
+      rm -f "$state/start-pending"
+      cleared=1
+      echo "repair: gateway healthy; cleared start-pending"
+    fi
+    if curl -sf -m 3 -o /dev/null "http://127.0.0.1:$port/readyz"; then
+      if [ -f "$mt_marker" ]; then
+        if ours_to_remove; then
+          if mt_rm_mine; then
+            echo "repair: gateway ready; removed $mt_marker"
+          else
+            echo "repair: gateway ready; $mt_marker changed hands, left in place"
+          fi
+        elif mt_owned; then
+          echo "repair: gateway ready; $mt_marker belongs to another run, left in place"
+        else
+          echo "repair: gateway ready; $mt_marker was not made by this lifecycle (no owner fields), left in place"
+        fi
+      fi
+      exit 0
+    fi
   fi
-  sleep 2
+  # Only a marker we own and may remove needs the heartbeat.
+  ours_to_remove && mt_touch_mine
+  sleep "$tick"
 done
-echo "repair: gateway not healthy within 600s; start-pending left set, the next start repairs first"
+[ -n "$cleared" ] || echo "repair: gateway not healthy within ${wait_secs}s; start-pending left set, the next start repairs first"
+if ours_to_remove && mt_rm_mine; then
+  echo "repair: gateway not ready within ${wait_secs}s; released the expired $mt_marker"
+fi
 exit 0
